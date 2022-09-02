@@ -7,6 +7,7 @@ import re
 import json
 import tqdm
 import operator
+import itertools
 import matplotlib.pyplot as plt
 
 Vector = List[float]
@@ -1311,3 +1312,378 @@ def load_weights(model: Layer, filename: str) -> None:
     # Then load using slice assignment
     for param, weight in zip(model.params(), weights):
         param[:] = weight
+
+def num_differences(v1: Vector, v2: Vector) -> int:
+    assert len(v1) == len(v2)
+    return len([x1 for x1, x2 in zip(v1, v2) if x1 != x2])
+
+def cluster_means(k: int,
+                  inputs: List[Vector],
+                  assignments: List[int]) -> List[Vector]:
+    # clusters[i] contains the inputs whose assignment is i
+    clusters = [[] for i in range(k)]
+    for input, assignment in zip(inputs, assignments):
+        clusters[assignment].append(input)
+
+    # if a cluster is empty, just use a random point
+    return [vector_mean(cluster) if cluster else random.choice(inputs)
+            for cluster in clusters]
+
+class KMeans:
+    def __init__(self, k: int) -> None:
+        self.k = k                      # number of clusters
+        self.means = None
+
+    def classify(self, input: Vector) -> int:
+        """return the index of the cluster closest to the input"""
+        return min(range(self.k),
+                   key=lambda i: squared_distance(input, self.means[i]))
+
+    def train(self, inputs: List[Vector]) -> None:
+        # Start with random assignments
+        assignments = [random.randrange(self.k) for _ in inputs]
+        with tqdm.tqdm(itertools.count()) as t:
+            for _ in t:
+                # Compute means and find new assignments
+                self.means = cluster_means(self.k, inputs, assignments)
+                new_assignments = [self.classify(input) for input in inputs]
+
+                # Check how many assignments changed and if we're done
+                num_changed = num_differences(assignments, new_assignments)
+                if num_changed == 0:
+                    return
+
+                # Otherwise keep the new assignments, and compute new means
+                assignments = new_assignments
+                self.means = cluster_means(self.k, inputs, assignments)
+                t.set_description(f"changed: {num_changed} / {len(inputs)}")
+
+def squared_clustering_errors(inputs: List[Vector], k: int) -> float:
+    """finds the total squared error from k-means clustering the inputs"""
+    clusterer = KMeans(k)
+    clusterer.train(inputs)
+    means = clusterer.means
+    assignments = [clusterer.classify(input) for input in inputs]
+
+    return sum(squared_distance(input, means[cluster])
+               for input, cluster in zip(inputs, assignments))
+
+class Leaf(NamedTuple):
+    value: Vector
+
+class Merged(NamedTuple):
+    children: tuple
+    order: int
+
+Cluster = Union[Leaf, Merged]
+
+def get_values(cluster: Cluster) -> List[Vector]:
+    if isinstance(cluster, Leaf):
+        return [cluster.value]
+    else:
+        return [value
+                for child in cluster.children
+                for value in get_values(child)]
+
+# we need to somehow merge the clusters with a notion of the distance
+def cluster_distance(cluster1: Cluster,
+                     cluster2: Cluster,
+                     distance_agg: Callable = min) -> float:
+    """
+    compute all the pairwise distances between cluster1 and cluster2
+    and apply the aggregation function _distance_agg_ to the resulting list
+    """
+    return distance_agg([distance(v1, v2)
+                         for v1 in get_values(cluster1)
+                         for v2 in get_values(cluster2)])
+
+def get_merge_order(cluster: Cluster) -> float:
+    if isinstance(cluster, Leaf):
+        return float('inf')  # was never merged
+    else:
+        return cluster.order
+
+def get_children(cluster: Cluster):
+    if isinstance(cluster, Leaf):
+        raise TypeError("Leaf has no children")
+    else:
+        return cluster.children
+
+def bottom_up_cluster(inputs: List[Vector],
+                      distance_agg: Callable = min) -> Cluster:
+    # Start with all leaves
+    clusters: List[Cluster] = [Leaf(input) for input in inputs]
+
+    def pair_distance(pair: Tuple[Cluster, Cluster]) -> float:
+        return cluster_distance(pair[0], pair[1], distance_agg)
+
+    # as long as we have more than one cluster left...
+    while len(clusters) > 1:
+        # find the two closest clusters
+        c1, c2 = min(((cluster1, cluster2)
+                      for i, cluster1 in enumerate(clusters)
+                      for cluster2 in clusters[:i]),
+                      key=pair_distance)
+
+        # remove them from the list of clusters
+        clusters = [c for c in clusters if c != c1 and c != c2]
+
+        # merge them, using merge_order = # of clusters left
+        merged_cluster = Merged((c1, c2), order=len(clusters))
+
+        # and add their merge
+        clusters.append(merged_cluster)
+
+    # when there's only one cluster left, return it
+    return clusters[0]
+
+def generate_clusters(base_cluster: Cluster,
+                      num_clusters: int) -> List[Cluster]:
+    # start with a list with just the base cluster
+    clusters = [base_cluster]
+    # as long as we don't have enough clusters yet...
+    while len(clusters) < num_clusters:
+        # choose the last-merged of our clusters
+        next_cluster = min(clusters, key=get_merge_order)
+        # remove it from the list
+        clusters = [c for c in clusters if c != next_cluster]
+        # and add its children to the list (i.e., unmerge it)
+        clusters.extend(get_children(next_cluster))
+
+    # once we have enough clusters...
+    return clusters
+
+transitions = defaultdict(list)
+
+def generate_using_bigrams() -> str:
+    current = "."   # this means the next word will start a sentence
+    result = []
+    while True:
+        next_word_candidates = transitions[current]    # bigrams (current, _)
+        current = random.choice(next_word_candidates)  # choose one at random
+        result.append(current)                         # append it to results
+        if current == ".": return " ".join(result)     # if "." we're done
+
+Grammar = Dict[str, List[str]]
+
+def is_terminal(token: str) -> bool:
+    return token[0] != "_"
+
+def expand(grammar: Grammar, tokens: List[str]) -> List[str]:
+    for i, token in enumerate(tokens):
+        # If this is a terminal token, skip it.
+        if is_terminal(token): continue
+        # Otherwise, it's a nonterminal token,
+        # so we need to choose a replacement at random.
+        replacement = random.choice(grammar[token])
+        if is_terminal(replacement):
+            tokens[i] = replacement
+        else:
+            # Replacement could be, e.g., "_NP _VP", so we need to
+            # split it on spaces and splice it in.
+            tokens = tokens[:i] + replacement.split() + tokens[(i+1):]
+        # Now call expand on the new list of tokens.
+        return expand(grammar, tokens)
+
+    # If we get here, we had all terminals and are done.
+    return tokens
+
+def generate_sentence(grammar: Grammar) -> List[str]:
+    return expand(grammar, ["_S"])
+
+# generating from distributions, Gibbs Sampling
+
+def roll_a_die() -> int:
+    return random.choice([1, 2, 3, 4, 5, 6])
+
+def direct_sample() -> Tuple[int, int]:
+    d1 = roll_a_die()
+    d2 = roll_a_die()
+    return d1, d1 + d2
+
+def random_y_given_x(x: int) -> int:
+    """equally likely to be x + 1, x + 2, ... , x + 6"""
+    return x + roll_a_die()
+
+# the other direction is harder to guess
+def random_x_given_y(y: int) -> int:
+    if y <= 7:
+        # if the total is 7 or less, the first die is equally likely to be
+        # 1, 2, ..., (total - 1)
+        return random.randrange(1, y)
+    else:
+        # if the total is 7 or more, the first die is equally likely to be
+        # (total - 6), (total - 5), ..., 6
+        return random.randrange(y - 6, 7)
+
+# we start with any valid values for x and y, then repeatedly alternate replacing x or y with a random value.
+def gibbs_sample(num_iters: int = 100) -> Tuple[int, int]:
+    x, y = 1, 2 # doesn't really matter
+    for _ in range(num_iters):
+        x = random_x_given_y(y)
+        y = random_y_given_x(x)
+    return x, y
+
+def compare_distributions(num_samples: int = 1000) -> Dict[int, List[int]]:
+    counts = defaultdict(lambda: [0, 0])
+    for _ in range(num_samples):
+        counts[gibbs_sample()][0] += 1
+        counts[direct_sample()][1] += 1
+    return counts
+
+def sample_from(weights: List[float]) -> int:
+    """returns i with probability weights[i] / sum(weights)"""
+    total = sum(weights)
+    rnd = total * random.random()      # uniform between 0 and total
+    for i, w in enumerate(weights):
+        rnd -= w                       # return the smallest i such that
+        if rnd <= 0: return i          # weights[0] + ... + weights[i] >= rnd
+
+def cosine_similarity(v1: Vector, v2: Vector) -> float:
+    return dot(v1, v2) / math.sqrt(dot(v1, v1) * dot(v2, v2))
+
+class Vocabulary:
+    def __init__(self, words: List[str] = None) -> None:
+        self.w2i: Dict[str, int] = {}  # mapping word -> word_id
+        self.i2w: Dict[int, str] = {}  # mapping word_id -> word
+        for word in (words or []):     # If words were provided,
+            self.add(word)             # add them.
+
+    @property
+    def size(self) -> int:
+        """how many words are in the vocabulary"""
+        return len(self.w2i)
+
+    def add(self, word: str) -> None:
+        if word not in self.w2i:        # If the word is new to us:
+            word_id = len(self.w2i)     # Find the next id.
+            self.w2i[word] = word_id    # Add to the word -> word_id map.
+            self.i2w[word_id] = word    # Add to the word_id -> word map.
+
+    def get_id(self, word: str) -> int:
+        """return the id of the word (or None)"""
+        return self.w2i.get(word)
+
+    def get_word(self, word_id: int) -> str:
+        """return the word with the given id (or None)"""
+        return self.i2w.get(word_id)
+
+    def one_hot_encode(self, word: str) -> Tensor:
+        word_id = self.get_id(word)
+        assert word_id is not None, f"unknown word {word}"
+        return [1.0 if i == word_id else 0.0 for i in range(self.size)]
+
+def save_vocab(vocab: Vocabulary, filename: str) -> None:
+    with open(filename, 'w') as f:
+        json.dump(vocab.w2i, f)       # Only need to save w2i
+
+def load_vocab(filename: str) -> Vocabulary:
+    vocab = Vocabulary()
+    with open(filename) as f:
+        # Load w2i and generate i2w from it
+        vocab.w2i = json.load(f)
+        vocab.i2w = {id: word for word, id in vocab.w2i.items()}
+    return vocab
+
+class Embedding(Layer):
+    def __init__(self, num_embeddings: int, embedding_dim: int) -> None:
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        # One vector of size embedding_dim for each desired embedding
+        self.embeddings = random_tensor(num_embeddings, embedding_dim)
+        self.grad = zeros_like(self.embeddings)
+        # Save last input id
+        self.last_input_id = None
+
+    def forward(self, input_id: int) -> Tensor:
+        """Just select the embedding vector corresponding to the input id"""
+        self.input_id = input_id    # remember for use in backpropagation
+        return self.embeddings[input_id]
+
+    def backward(self, gradient: Tensor) -> None:
+        # Zero out the gradient corresponding to the last input.
+        # This is way cheaper than creating a new all-zero tensor each time.
+        if self.last_input_id is not None:
+            zero_row = [0 for _ in range(self.embedding_dim)]
+            self.grad[self.last_input_id] = zero_row
+        self.last_input_id = self.input_id
+        self.grad[self.input_id] = gradient
+    
+    def params(self) -> Iterable[Tensor]:
+        return [self.embeddings]
+
+    def grads(self) -> Iterable[Tensor]:
+        return [self.grad]
+
+class TextEmbedding(Embedding):
+    def __init__(self, vocab: Vocabulary, embedding_dim: int) -> None:
+        # Call the superclass constructor
+        super().__init__(vocab.size, embedding_dim)
+        # And hang onto the vocab
+        self.vocab = vocab
+
+    def __getitem__(self, word: str) -> Tensor:
+        word_id = self.vocab.get_id(word)
+        if word_id is not None:
+            return self.embeddings[word_id]
+        else:
+            return None
+    
+    def closest(self, word: str, n: int = 5) -> List[Tuple[float, str]]:
+        """Returns the n closest words based on cosine similarity"""
+        vector = self[word]
+        # Compute pairs (similarity, other_word), and sort most similar first
+        scores = [(cosine_similarity(vector, self.embeddings[i]), other_word)
+                  for other_word, i in self.vocab.w2i.items()]
+        scores.sort(reverse=True)
+        return scores[:n]
+
+class SimpleRnn(Layer):
+    """Just about the simplest possible recurrent layer."""
+    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.w = random_tensor(hidden_dim, input_dim, init='xavier')
+        self.u = random_tensor(hidden_dim, hidden_dim, init='xavier')
+        self.b = random_tensor(hidden_dim)
+        self.reset_hidden_state()
+
+    def reset_hidden_state(self) -> None:
+        self.hidden = [0 for _ in range(self.hidden_dim)]
+
+    def forward(self, input: Tensor) -> Tensor:
+        self.input = input              # Save both input and previous
+        self.prev_hidden = self.hidden  # hidden state to use in backprop.
+        a = [(dot(self.w[h], input) +           # weights @ input
+              dot(self.u[h], self.hidden) +     # weights @ hidden
+              self.b[h])                        # bias
+             for h in range(self.hidden_dim)]
+        self.hidden = tensor_apply(tanh, a)  # Apply tanh activation
+        return self.hidden                   # and return the result.
+
+    def backward(self, gradient: Tensor):
+        # Backpropagate through the tanh
+        a_grad = [gradient[h] * (1 - self.hidden[h] ** 2)
+                  for h in range(self.hidden_dim)]
+        # b has the same gradient as a
+        self.b_grad = a_grad
+        # Each w[h][i] is multiplied by input[i] and added to a[h],
+        # so each w_grad[h][i] = a_grad[h] * input[i]
+        self.w_grad = [[a_grad[h] * self.input[i]
+                        for i in range(self.input_dim)]
+                       for h in range(self.hidden_dim)]
+        # Each u[h][h2] is multiplied by hidden[h2] and added to a[h],
+        # so each u_grad[h][h2] = a_grad[h] * prev_hidden[h2]
+        self.u_grad = [[a_grad[h] * self.prev_hidden[h2]
+                        for h2 in range(self.hidden_dim)]
+                       for h in range(self.hidden_dim)]
+        # Each input[i] is multiplied by every w[h][i] and added to a[h],
+        # so each input_grad[i] = sum(a_grad[h] * w[h][i] for h in ...)
+        return [sum(a_grad[h] * self.w[h][i] for h in range(self.hidden_dim))
+                for i in range(self.input_dim)]
+
+    def params(self) -> Iterable[Tensor]:
+        return [self.w, self.u, self.b]
+
+    def grads(self) -> Iterable[Tensor]:
+        return [self.w_grad, self.u_grad, self.b_grad]
